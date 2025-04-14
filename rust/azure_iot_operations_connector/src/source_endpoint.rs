@@ -3,6 +3,8 @@
 
 //! Traits and types for Source Endpoint implementations.
 
+use std::{collections::HashMap, time::Duration};
+
 use tokio_util::sync::CancellationToken;
 
 // TODO: remove
@@ -16,14 +18,16 @@ use crate::{
     },
 };
 
-// pub enum ReplicaConfig {
-//   ActiveActive,
-//   /// Provide desired lease duration (default is 1 second)
-//   ActivePassive(Duration)
-// }
+pub enum ReplicaConfig {
+    ActiveActive,
+    /// Provide desired lease duration (default is 1 second)
+    ActivePassive(Option<Duration>),
+}
 
 pub trait SourceEndpointFactory {
     type SE: SourceEndpoint + Send + Sync + 'static;
+
+    fn get_replica_config(&self) -> ReplicaConfig;
 
     /// Returns an error if the aep is invalid for this `SourceEndpoint` type
     /// TODO: need to give some config to the base connector for Active/Active vs Active/Passive and lease duration
@@ -34,6 +38,10 @@ pub trait SourceEndpointFactory {
 }
 
 pub trait SourceEndpoint {
+    fn update_asset_endpoint_profile_source_endpoint(
+        &self,
+        aep: AssetEndpointProfile,
+    ) -> Result<(), String>;
     /// Does any start tasks necessary for the `SourceEndpoint`
     /// May establish the connection for aep
     /// Returns an error if the connection could not be established
@@ -47,13 +55,13 @@ pub trait SourceEndpoint {
     // fn update_aep(self) -> impl std::future::Future<Output = Result<Self, String>> + std::marker::Send;
 
     /// notifies source endpoint of a new asset
-    fn asset_created_notification(&self, asset_name: String, asset_definition: &AssetDefinition);
+    // fn asset_created_notification(&self, asset_name: String, asset_definition: &AssetDefinition);
 
-    /// notifies source endpoint of an updated asset
-    fn asset_updated_notification(&self, asset_name: String, asset_definition: &AssetDefinition);
+    // /// notifies source endpoint of an updated asset
+    // fn asset_updated_notification(&self, asset_name: String, asset_definition: &AssetDefinition);
 
-    /// notifies source endpoint of a new asset
-    fn asset_deleted_notification(&self, asset_name: String);
+    // /// notifies source endpoint of a new asset
+    // fn asset_deleted_notification(&self, asset_name: String);
 
     // TODO: will need some way of notifying the source_endpoint that an aep has been stopped (maybe an asset as well?)
     // it could get this from drop, but it would be helpful to be more explicit
@@ -61,6 +69,7 @@ pub trait SourceEndpoint {
     /// Given an aep, `asset_definition`, and dataset, generates a `MessageSchema` to send to the Schema Registry Client.
     /// This could create a datasetSampler if the implementation wanted
     /// TODO: should this be able to return an error?
+    /// async? if this needs to be a network call to the endpoint
     fn get_dataset_message_schema(
         &self,
         asset_definition: &AssetDefinition,
@@ -100,20 +109,12 @@ pub trait SourceEndpoint {
         current_message_schema: &MessageSchema,
     ) -> Option<MessageSchema>;
 
-    fn dataset_created_notification(
+    fn asset_created_notification(
         &self,
         asset_name: String,
-        // dataset_name: String,
-        dataset: &Dataset,
-        forwarder: Forwarder, // Forwarder or DataTransformer+Forwarder? Depends whether DataTransformer lives in the source endpoint or base connector code
-        ct: CancellationToken,
-    );
-    fn event_created_notification(
-        &self,
-        asset_name: String,
-        // event_name: String,
-        event: &Event,
-        forwarder: Forwarder,
+        asset_definition: &AssetDefinition,
+        event_forwarders: HashMap<String, Forwarder>,
+        dataset_forwarders: HashMap<String, Forwarder>, // TODO: nest within asset definition
         ct: CancellationToken,
     );
 
@@ -135,7 +136,7 @@ pub trait SourceEndpoint {
 
 pub enum EventType<T> {
     Created(T),
-    Updated(T),
+    Updated(T), // can't have an AEP update
     Deleted(String),
 }
 
@@ -143,4 +144,7 @@ pub enum Notification {
     Asset(EventType<AssetDefinition>),
     Dataset(EventType<Dataset>),
     Event(EventType<Event>),
+    /// pause all operations until Connector is Active again
+    Pause,
+    Unpause,
 }

@@ -13,12 +13,12 @@ use azure_iot_operations_mqtt::{
     },
 };
 use azure_iot_operations_protocol::application::ApplicationContext;
-use azure_iot_operations_services::{schema_registry, state_store};
+use azure_iot_operations_services::{leased_lock, schema_registry, state_store};
 use derive_builder::Builder;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::source_endpoint::SourceEndpoint;
+use crate::source_endpoint::{ReplicaConfig, SourceEndpoint};
 use crate::{
     destination_endpoint::{self, DestinationEndpoint},
     file_mount_azure_device_registry::adr_client::{
@@ -39,12 +39,23 @@ where
 }
 
 #[derive(Clone)]
+pub struct ConnectorConfig {
+    /// The name of the connector
+    pub connector_id: Vec<u8>,
+    /// The mqtt client id
+    pub client_id: Vec<u8>,
+
+    pub shard_strategy: String,
+}
+
+#[derive(Clone)]
 struct ConnectorContext {
     // name that would be in asset definition to destination endpoint
     destination_endpoints: Arc<HashMap<String, Box<dyn DestinationEndpoint>>>,
     asset_monitor: Arc<ADRClient>,
     schema_registry_client: schema_registry::Client<SessionManagedClient>,
     default_timeout: Duration,
+    connector_config: ConnectorConfig,
 }
 
 #[derive(Builder)]
@@ -95,6 +106,12 @@ where
             .unwrap(); // can't fail
         let session = Session::new(session_options).unwrap(); // can fail if bad outgoing max
         let connection_monitor = session.create_connection_monitor();
+        // TODO: from file mount
+        let connector_config = ConnectorConfig {
+            connector_id: "".into(),
+            client_id: "".into(), // TODO: from connection settings
+            shard_strategy: "".to_string(),
+        };
         let schema_registry_client = schema_registry::Client::new(
             application_context.clone(),
             &session.create_managed_client(),
@@ -144,6 +161,7 @@ where
                 asset_monitor: Arc::new(asset_monitor),
                 schema_registry_client,
                 default_timeout: connector_options.default_timeout,
+                connector_config,
             },
             source_endpoint_factory,
             state_store_client: arc_state_store_client,
@@ -176,7 +194,24 @@ where
         state_store_client: Arc<state_store::Client<SessionManagedClient>>,
     ) -> Result<(), String> {
         // TODO: make sure to shutdown if cancellation token is called up here too - maybe split everything that isn't shutdown out to another function to capture any errors/cancellation
-
+        let mut ll_client = None;
+        let replica_config = source_endpoint_factory.get_replica_config();
+        match replica_config {
+            ReplicaConfig::ActiveActive => {
+                // will get more information on sharding strategy for this to know which assets/etc for this connector to be responsible for
+            }
+            ReplicaConfig::ActivePassive(lease_duration) => {
+                // create LL client
+                ll_client = Some(
+                    leased_lock::Client::new(
+                        state_store_client.clone(),
+                        connector_context.connector_config.connector_id.clone(),
+                        connector_context.connector_config.client_id.clone(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
         // read AEP (ADR client)
         let mut aep_creates_observation = connector_context
             .asset_monitor
@@ -281,6 +316,12 @@ where
     // do we want to give a shutdown method that breaks out of the loop or have them provide a cancellationToken/Notify?
 }
 
+// // any time that the lease status changes, return the new status
+// async fn manage_leased_lock() -> bool {
+//     // if lock is held, wait for it to be released
+//     // if lock isn't held, block on acquiring the lock
+// }
+
 #[derive(Clone)]
 struct AssetEndpointProfileContext {
     connector_context: ConnectorContext,
@@ -359,7 +400,7 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
 
             let source_endpoint = Arc::new(source_endpoint);
             let asset_definition_context = AssetDefinitionContext {
-                source_endpoint,
+                source_endpoint: source_endpoint.clone(),
                 connector_context: aep_context.connector_context.clone(),
                 root_cancellation_token: aep_context.root_cancellation_token.child_token(),
             };
@@ -435,9 +476,39 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                     recv_result = aep_update_observation.recv() => {
                         match recv_result {
                             Some(new_aep) => {
-                                // aep has been updated, end it and return the new one
-                                ct.cancel();
-                                return EndReason::Updated(new_aep);
+                                // aep has been updated, register with protocol translator
+                                match source_endpoint.update_asset_endpoint_profile_source_endpoint(new_aep) {
+                                  Ok(()) => {
+                                   aep_context
+                                        .connector_context
+                                        .asset_monitor
+                                        .update_aep_status("aep.name".to_string(), None)
+                                        .await
+                                        .unwrap();
+                                  },
+                                  // TODO: change create aep se to return a vector of errors so we don't need to do as much translation
+                                  Err(e) => {
+                                      aep_context
+                                          .connector_context
+                                          .asset_monitor
+                                          .update_aep_status(
+                                              "aep.name".to_string(),
+                                              Some(AssetEndpointProfileStatus {
+                                                  errors: vec![ADRError {
+                                                      code: 1,
+                                                      message: e.clone(),
+                                                  }],
+                                              }),
+                                          )
+                                          .await
+                                          .unwrap();
+                                      return EndReason::Error;
+                                  }
+                                }
+                                if let Err(e) = source_endpoint.start().await {
+                                  log::error!("Error starting source endpoint: {e}");
+                                  return EndReason::Error;
+                                }
                             },
                             None => {
                                 // no more notifications will be received, fatal?
@@ -445,7 +516,7 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                                 return EndReason::Error;
                             }
                         }
-                    }
+                    },
                     next_result = join_set.join_next() => {
                         match next_result {
                             Some(Ok(Ok(result))) => {
@@ -621,6 +692,8 @@ async fn init_asset<SE: SourceEndpoint + Send + Sync + 'static>(
         errors: None,
         version: Some(1), // asset_definition.asset_specification_schema.version
     };
+    let mut dataset_forwarders = HashMap::new();
+    let mut event_forwarders = HashMap::new();
     // DSS vs telemetry set at the asset definition level.
     let Some(destination_endpoint) = destination_endpoints.get(&asset_definition.target) else {
         asset_status.add_error(ADRError {
@@ -707,42 +780,7 @@ async fn init_asset<SE: SourceEndpoint + Send + Sync + 'static>(
                 continue;
             }
         };
-        source_endpoint.dataset_created_notification(
-            asset_definition.name.clone(),
-            &dataset,
-            forwarder,
-            cancellation_token.child_token(),
-        );
-
-        // // spawn task per dataset? make sure this can exit as well.
-        // join_set.spawn({
-        //     let source_endpoint_clone = source_endpoint.clone();
-        //     let ct = cancellation_token.clone();
-        //     let frequency = asset_definition.frequency;
-        //     // TODO: might have to update this to be per datapoint instead of per dataset
-        //     async move {
-        //         loop {
-        //             tokio::select! {
-        //               () = ct.cancelled() => {
-        //                 return Ok(());
-        //               },
-        //               () = tokio::time::sleep(frequency) => { // TODO: dataset.frequency
-        //                 let message_payload = source_endpoint_clone
-        //                   .sample_dataset(&dataset)
-        //                   .await // log error and continue if not fatal (?)
-        //                   .unwrap(); // need to have it tell us if the component fatal error or fatal error
-
-        //                   // TRANSFORM - should be option on connector to use no transformation, json transformation, avro transformation, or wasm transformer?
-        //                 // have this send a message on a channel to the asset forwarder manager
-        //                 // instead of sending the message itself
-        //                 forwarder.send(
-        //                     message_payload
-        //                 ).unwrap(); // fatal // log error and end because it's fatal? Maybe try to recreate forwarder?
-        //               }
-        //             }
-        //         }
-        //     }
-        // });
+        dataset_forwarders.insert(dataset.name, forwarder);
     }
     for event in asset_definition.events.clone() {
         // get message schema and send to SR
@@ -809,53 +847,14 @@ async fn init_asset<SE: SourceEndpoint + Send + Sync + 'static>(
                 continue;
             }
         };
-        source_endpoint.event_created_notification(
-            asset_definition.name.clone(),
-            &event,
-            forwarder,
-            cancellation_token.clone(),
-        );
-
-        // let mut event_receiver_result = source_endpoint_clone.get_event_receiver(&event);
-        // match source_endpoint.get_event_receiver(&event) {
-        //     Ok(mut event_receiver) => {
-        //         // spawn task per event? make sure this can exit as well.
-        //         join_set.spawn({
-        //             let ct = cancellation_token.clone();
-        //             async move {
-        //                 // this will be event driven
-        //                 loop {
-        //                     tokio::select! {
-        //                         () = ct.cancelled() => {
-        //                             log::error!("'{}' event receiver has been cancelled", event.name);
-        //                             return Ok(());
-        //                         },
-        //                         msg = event_receiver.recv() => {
-        //                             if let Some(message_payload) = msg {
-        //                                 forwarder.send(
-        //                                     message_payload
-        //                                 ).unwrap(); // retry and log errors
-        //                             } else {
-        //                                 // no more events will be sent, return adr error
-        //                                 log::error!("No more '{}' events will be received from source endpoint ", event.name);
-        //                                 return Err(ADRError { code: 1, message: "Event receiver closed".to_string() });
-        //                             }
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         });
-        //     }
-        //     Err(e) => {
-        //         log::error!("Error getting event receiver: {}", e);
-        //         asset_status.add_error(ADRError {
-        //             code: 1,
-        //             message: e,
-        //         });
-        //         // TODO: remove from events_schemas? remove from SR?
-        //         continue;
-        //     }
-        // }
+        event_forwarders.insert(event.name.clone(), forwarder);
     }
+    source_endpoint.asset_created_notification(
+        asset_definition.name.clone(),
+        asset_definition,
+        dataset_forwarders,
+        event_forwarders,
+        cancellation_token,
+    );
     (asset_status, join_set)
 }
