@@ -13,7 +13,7 @@ use azure_iot_operations_mqtt::{
     },
 };
 use azure_iot_operations_protocol::application::ApplicationContext;
-use azure_iot_operations_services::{leased_lock, schema_registry, state_store};
+use azure_iot_operations_services::{schema_registry, state_store};
 use derive_builder::Builder;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,8 @@ use crate::{
     },
     source_endpoint::SourceEndpointFactory,
 };
+
+use super::ReplicaManager;
 
 pub struct Connector<SEF>
 where
@@ -194,24 +196,26 @@ where
         state_store_client: Arc<state_store::Client<SessionManagedClient>>,
     ) -> Result<(), String> {
         // TODO: make sure to shutdown if cancellation token is called up here too - maybe split everything that isn't shutdown out to another function to capture any errors/cancellation
-        let mut ll_client = None;
-        let replica_config = source_endpoint_factory.get_replica_config();
-        match replica_config {
+        let replica_manager = match source_endpoint_factory.get_replica_config() {
             ReplicaConfig::ActiveActive => {
                 // will get more information on sharding strategy for this to know which assets/etc for this connector to be responsible for
+                ReplicaManager::new_active_active()
             }
-            ReplicaConfig::ActivePassive(lease_duration) => {
-                // create LL client
-                ll_client = Some(
-                    leased_lock::Client::new(
-                        state_store_client.clone(),
-                        connector_context.connector_config.connector_id.clone(),
-                        connector_context.connector_config.client_id.clone(),
-                    )
-                    .unwrap(),
-                );
+            ReplicaConfig::ActivePassive(provided_lease_duration) => {
+                ReplicaManager::new_active_passive(
+                    connector_context.connector_config.client_id.clone(),
+                    connector_context.connector_config.connector_id.clone(),
+                    provided_lease_duration,
+                    connector_context.default_timeout,
+                    state_store_client.clone(),
+                )
             }
-        }
+        };
+
+        replica_manager.become_active().await;
+        // send active notification to source endpoint
+        let mut passive_observation = replica_manager.observe_becomes_passive().await;
+
         // read AEP (ADR client)
         let mut aep_creates_observation = connector_context
             .asset_monitor
@@ -249,6 +253,21 @@ where
 
         loop {
             tokio::select!(
+              // TODO: make this so it only returns on the change between active and passive, not duplicate passive notifications
+              passive_notification = passive_observation.recv_notification() => {
+                match passive_notification {
+                  Some(()) => {
+                    // send notification that we're now passive
+                    // cancel all underlying tasks
+                    aep_context.root_cancellation_token.cancel();
+                    // don't do anything else until we become active again
+                    replica_manager.become_active().await;
+                    // send notification that we're now active
+                    // TODO: re-run all start up tasks of getting all aeps
+                  },
+                  None => return Ok(()),
+                }
+              },
                 // TODO: may need branch for monitoring connector config too?
                 recv_result = aep_creates_observation.recv() => {
                     if let Some(aep) = recv_result {
@@ -273,16 +292,8 @@ where
                             // if the aep finished, it will have reported it's status already. We just need to remove it from our tracking and continue
                             match result {
                                 EndReason::Deleted => todo!(),
-                                EndReason::Updated(aep) => {
-                                    match aep_tasks(aep_context.clone(), &source_endpoint_factory, aep).await
-                                    {
-                                        Ok(join_handle) => {
-                                            aeps_join_set.spawn(join_handle);
-                                        },
-                                        Err(e) => {
-                                            log::error!("Error creating source endpoint: {e}");
-                                        }
-                                    }
+                                EndReason::Updated(_) => {
+                                  // isn't possible for aeps, might need to update enum
                                 },
                                 EndReason::Error => todo!(),
                                 EndReason::Finished => todo!(),
@@ -303,6 +314,11 @@ where
 
         // shutdown all clients
         // fields.asset_monitor.shutdown().await.unwrap();
+        // let mut aep_creates_unobservation = connector_context
+        //   .asset_monitor
+        //   .unobserve_asset_endpoint_profile_creates()
+        //   .await
+        //   .unwrap(); // metric log error and return after retries
         connector_context
             .schema_registry_client
             .shutdown()
@@ -440,11 +456,13 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                     }
                 }
             }
+            let end_reason;
 
             loop {
                 tokio::select!(
                     () = ct.cancelled() => {
-                        return EndReason::Finished;
+                      end_reason = EndReason::Finished;
+                      break;
                     },
                     recv_result = asset_definition_creates_observation.recv() => {
                         if let Some(asset_definition) = recv_result {
@@ -455,7 +473,8 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                             // }
                         } else {
                             // no more notifications will be received, fatal? Or keep waiting because there can be other notifications? Or restart it?
-                            return EndReason::Error;
+                            end_reason = EndReason::Error;
+                            break;
                        }
                     },
                     recv_result = aep_delete_observation.recv() => {
@@ -464,12 +483,14 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                                 // aep has been deleted, return
                                 ct.cancel();
                                 // TODO: call unobserve for this AEP
-                                return EndReason::Deleted;
+                                end_reason = EndReason::Deleted;
+                                break;
                             },
                             None => {
                                 // no more notifications will be received, fatal?
                                 // metric log error
-                                return EndReason::Error;
+                                end_reason = EndReason::Error;
+                                break;
                             }
                         }
                     }
@@ -502,18 +523,21 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                                           )
                                           .await
                                           .unwrap();
-                                      return EndReason::Error;
+                                        end_reason = EndReason::Error;
+                                        break;
                                   }
                                 }
                                 if let Err(e) = source_endpoint.start().await {
                                   log::error!("Error starting source endpoint: {e}");
-                                  return EndReason::Error;
+                                  end_reason = EndReason::Error;
+                                  break;
                                 }
                             },
                             None => {
                                 // no more notifications will be received, fatal?
                                 // metric log error
-                                return EndReason::Error;
+                                end_reason = EndReason::Error;
+                                break;
                             }
                         }
                     },
@@ -545,7 +569,33 @@ async fn aep_tasks<SEF: SourceEndpointFactory + Send + Sync + 'static>(
                 );
             }
 
-            // any cleanup needed?
+            // any cleanup needed
+            // let delete_result = aep_context
+            //     .connector_context
+            //     .asset_monitor
+            //     .unobserve_asset_endpoint_profile_deletes(aep.name.clone())
+            //     .await
+            //     .unwrap();
+            // let update_result = aep_context
+            //     .connector_context
+            //     .asset_monitor
+            //     .unobserve_asset_endpoint_profile_updates(aep.name.clone())
+            //     .await
+            //     .unwrap();
+
+            // // asset_observation from asset_monitor
+            // let asset_creates_result = aep_context
+            //     .connector_context
+            //     .asset_monitor
+            //     .unobserve_asset_definition_creates()
+            //     .await
+            //     .map_err(|e| ADRError {
+            //         code: 2,
+            //         message: e,
+            //     })
+            //     .unwrap();
+
+            return end_reason;
         }
     }))
 }
