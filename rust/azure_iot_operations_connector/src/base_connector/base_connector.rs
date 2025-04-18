@@ -735,6 +735,7 @@ async fn init_asset<SE: SourceEndpoint + Send + Sync + 'static>(
     default_timeout: Duration,
     cancellation_token: CancellationToken,
 ) -> (AssetStatus, JoinSet<Result<(), ADRError>>) {
+    // need touchpoint to let source endpoint say the asset is invalid
     let mut join_set = JoinSet::new();
     let mut asset_status = AssetStatus {
         datasets_schema: None,

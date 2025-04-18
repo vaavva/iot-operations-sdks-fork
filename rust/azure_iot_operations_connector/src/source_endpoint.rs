@@ -29,6 +29,8 @@ pub trait SourceEndpointFactory {
 
     fn get_replica_config(&self) -> ReplicaConfig;
 
+    fn get_inbound_endpoint_type(&self) -> String;
+
     /// Returns an error if the aep is invalid for this `SourceEndpoint` type
     /// TODO: need to give some config to the base connector for Active/Active vs Active/Passive and lease duration
     fn create_asset_endpoint_profile_source_endpoint(
@@ -50,6 +52,8 @@ pub trait SourceEndpoint {
     /// aep_deleted
     fn shutdown(&self)
     -> impl std::future::Future<Output = Result<(), String>> + std::marker::Send;
+
+    fn validate_asset(&self, asset: AssetDefinition) -> Result<(), String>;
 
     /// implementation can create a new SourceEndpoint or modify the existing one
     // fn update_aep(self) -> impl std::future::Future<Output = Result<Self, String>> + std::marker::Send;
@@ -75,7 +79,7 @@ pub trait SourceEndpoint {
         asset_definition: &AssetDefinition,
         dataset_name: String,
         dataset: &Dataset,
-    ) -> Option<MessageSchema>;
+    ) -> Option<(MessageSchema, String)>; // String is content_type
     // TODO: return content_type here too?
     // ) -> Result<MessageSchema, String>; TODO: switch to result - they should have to provide one otherwise ADR cloud is funky
 
@@ -87,7 +91,7 @@ pub trait SourceEndpoint {
         dataset_name: String,
         dataset: &Dataset,
         current_message_schema: &MessageSchema,
-    ) -> Option<MessageSchema>;
+    ) -> Option<(MessageSchema, String)>; // String is content_type
 
     /// Given an aep, `asset_definition`, and event, generates a `MessageSchema` to send to the Schema Registry Client.
     /// TODO: should this be able to return an error?
@@ -96,7 +100,7 @@ pub trait SourceEndpoint {
         asset_definition: &AssetDefinition,
         event_name: String,
         event: &Event,
-    ) -> Option<MessageSchema>;
+    ) -> Option<(MessageSchema, String)>; // String is content_type
     // ) -> Result<MessageSchema, String>; TODO: switch to result - they should have to provide one otherwise ADR cloud is funky
 
     /// If a message schema is already on the asset,
@@ -107,7 +111,7 @@ pub trait SourceEndpoint {
         event_name: String,
         event: &Event,
         current_message_schema: &MessageSchema,
-    ) -> Option<MessageSchema>;
+    ) -> Option<(MessageSchema, String)>; // String is content_type
 
     fn asset_created_notification(
         &self,
