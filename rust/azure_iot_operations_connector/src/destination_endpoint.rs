@@ -42,6 +42,7 @@ pub trait AssetForwarderFactory: Send + Sync {
     ) -> Result<Forwarder, String>;
 }
 
+#[derive(Clone)]
 pub struct Forwarder {
     tx: UnboundedSender<(SerializedPayload, oneshot::Sender<Result<(), String>>)>,
 }

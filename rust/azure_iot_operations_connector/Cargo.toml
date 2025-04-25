@@ -19,6 +19,10 @@ derive_builder.workspace = true
 log.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tinykube_hostlib = { git = "https://github.com/clecompt-msft/tinykube.git" }
+
+parking_lot = "*"
+wasmtime = "*"
 
 [dev-dependencies]
 env_logger.workspace = true

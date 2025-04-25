@@ -5,6 +5,8 @@
 
 // use crate::{file_mount_azure_device_registry::adr_client::Dataset, destination_endpoint::Forwarder};
 
+pub mod tinykube;
+
 // one per connector
 // pub trait DataTransformer {
 //   fn new(
